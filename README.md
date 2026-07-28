@@ -9,9 +9,13 @@ Built to ingest, validate, store, and analyze **Day-Ahead Prices**, **Actual Gen
 ## 📸 Application Highlights & Visual Analytics
 
 ### Market Overview & Dashboard
-![Dashboard Overview](pictures/Overview.mp4)
+![Dashboard Overview](pictures/dashboard.png)
 
+### Quantitative Analytics & Feature Engineering
+![Analytics Tab](pictures/analytics_tab.png)
 
+### Intraday Price vs. Renewable Generation Correlation
+![Price Correlation Scatter Plot](pictures/market_stats.png)
 
 ---
 
