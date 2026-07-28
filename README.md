@@ -6,6 +6,15 @@ Built to ingest, validate, store, and analyze **Day-Ahead Prices**, **Actual Gen
 
 ---
 
+## 📸 Application Highlights & Visual Analytics
+
+### Market Overview & Dashboard
+![Dashboard Overview](pictures/Overview.mp4)
+
+
+
+---
+
 ## 🏗️ System Architecture & Data Methodology
 
 ```mermaid
@@ -40,4 +49,3 @@ flowchart TD
     subgraph Automation ["🤖 CI/CD Orchestration"]
         K[GitHub Actions Daily Cron Job] -->|Triggers at 06:00 UTC| B
     end
-    
