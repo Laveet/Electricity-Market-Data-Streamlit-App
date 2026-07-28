@@ -1,0 +1,23 @@
+bidding_zones:
+  DE_LU:
+    name: "Germany / Luxembourg"
+    eic: "10Y1001A1001A82H"
+    currency: "EUR"
+    timezone: "Europe/Berlin"
+  FR:
+    name: "France"
+    eic: "10YFR-RTE------C"
+    currency: "EUR"
+    timezone: "Europe/Paris"
+  NL:
+    name: "Netherlands"
+    eic: "10YNL----------L"
+    currency: "EUR"
+    timezone: "Europe/Amsterdam"
+
+document_types:
+  day_ahead_prices: "A44"
+  intraday_prices: "A44"
+  intraday_volume: "A07"
+  actual_generation: "A75"
+  total_load: "A65"
