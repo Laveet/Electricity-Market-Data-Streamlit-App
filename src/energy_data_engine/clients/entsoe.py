@@ -1,147 +1,4 @@
-# import asyncio
-# import pandas as pd
-# from datetime import datetime
-# from typing import List, Optional
-# from entsoe import EntsoePandasClient
 
-# from config.settings import settings
-# from src.energy_data_engine.utils.logger import logger
-# from src.energy_data_engine.utils.retry import async_retry
-# from src.energy_data_engine.models.schemas import (
-#     DayAheadPriceRecord,
-#     IntradayPriceRecord,
-#     TotalLoadRecord,
-#     GenerationRecord,
-# )
-
-
-# class AsyncEntsoeClient:
-#     """Asynchronous client wrapper for ENTSO-E Transparency API using entsoe-py."""
-
-#     def __init__(self, api_key: Optional[str] = None):
-#         self.api_key = api_key or settings.ENTSOE_API_KEY
-#         if not self.api_key:
-#             logger.warning("ENTSOE_API_KEY is not set. API requests will fail if unmocked.")
-#         self._sync_client = EntsoePandasClient(api_key=self.api_key)
-#         self.zone_config = settings.load_zone_config()
-
-#     def _get_eic(self, zone_code: str) -> str:
-#         """Helper to fetch EIC code for a bidding zone."""
-#         zone_info = self.zone_config.get("bidding_zones", {}).get(zone_code.upper())
-#         if not zone_info:
-#             raise ValueError(f"Unknown bidding zone: {zone_code}. Defined zones: {list(self.zone_config.get('bidding_zones', {}).keys())}")
-#         return zone_info["eic"]
-
-#     # =======================================================
-#     # 1. Day-Ahead Prices (DocumentType: A44)
-#     # =======================================================
-#     @async_retry(retries=3, backoff_factor=1.5)
-#     async def fetch_day_ahead_prices(
-#         self, bidding_zone: str, start: datetime, end: datetime
-#     ) -> List[DayAheadPriceRecord]:
-#         """Fetches Day-Ahead Electricity Prices (€/MWh) for a specified zone."""
-#         eic_code = self._get_eic(bidding_zone)
-#         logger.info("Fetching Day-Ahead Prices", zone=bidding_zone, start=start.isoformat(), end=end.isoformat())
-
-#         # Offload blocking synchronous call to a threadpool worker
-#         df: pd.Series = await asyncio.to_thread(
-#             self._sync_client.query_day_ahead_prices,
-#             country_code=bidding_zone.upper(),
-#             start=pd.Timestamp(start),
-#             end=pd.Timestamp(end),
-#         )
-
-#         records = []
-#         for timestamp, price in df.items():
-#             if pd.isna(price):
-#                 continue
-#             record = DayAheadPriceRecord(
-#                 timestamp=timestamp,
-#                 bidding_zone=bidding_zone,
-#                 price_eur_mwh=float(price),
-#             )
-#             records.append(record)
-
-#         logger.info("Successfully fetched Day-Ahead Prices", zone=bidding_zone, count=len(records))
-#         return records
-
-#     # =======================================================
-#     # 2. Total Load / Grid Demand (DocumentType: A65)
-#     # =======================================================
-#     @async_retry(retries=3, backoff_factor=1.5)
-#     async def fetch_total_load(
-#         self, bidding_zone: str, start: datetime, end: datetime
-#     ) -> List[TotalLoadRecord]:
-#         """Fetches Actual Grid Demand / Load (MW) for a specified zone."""
-#         logger.info("Fetching Total Load", zone=bidding_zone, start=start.isoformat(), end=end.isoformat())
-
-#         df: pd.DataFrame | pd.Series = await asyncio.to_thread(
-#             self._sync_client.query_load,
-#             country_code=bidding_zone.upper(),
-#             start=pd.Timestamp(start),
-#             end=pd.Timestamp(end),
-#         )
-
-#         # Handle Series or DataFrame responses from entsoe-py
-#         series = df["Actual Load"] if isinstance(df, pd.DataFrame) and "Actual Load" in df.columns else df
-
-#         records = []
-#         for timestamp, load in series.items():
-#             if pd.isna(load):
-#                 continue
-#             records.append(
-#                 TotalLoadRecord(
-#                     timestamp=timestamp,
-#                     bidding_zone=bidding_zone,
-#                     load_mw=float(load),
-#                 )
-#             )
-
-#         logger.info("Successfully fetched Total Load", zone=bidding_zone, count=len(records))
-#         return records
-
-#     # =======================================================
-#     # 3. Actual Generation per Production Type (DocumentType: A75)
-#     # =======================================================
-#     @async_retry(retries=3, backoff_factor=1.5)
-#     async def fetch_generation(
-#         self, bidding_zone: str, start: datetime, end: datetime
-#     ) -> List[GenerationRecord]:
-#         """Fetches Generation per Production Type (MW) for a specified zone."""
-#         logger.info("Fetching Generation Mix", zone=bidding_zone, start=start.isoformat(), end=end.isoformat())
-
-#         df: pd.DataFrame = await asyncio.to_thread(
-#             self._sync_client.query_generation,
-#             country_code=bidding_zone.upper(),
-#             start=pd.Timestamp(start),
-#             end=pd.Timestamp(end),
-#         )
-
-#         records = []
-#         for timestamp, row in df.iterrows():
-#             # Map standard ENTSO-E columns to schema fields with default 0.0
-#             solar = row.get("Solar", 0.0)
-#             wind_onshore = row.get("Wind Onshore", 0.0)
-#             wind_offshore = row.get("Wind Offshore", 0.0)
-#             gas = row.get("Fossil Gas", 0.0)
-#             coal = row.get("Fossil Hard coal", 0.0)
-#             nuclear = row.get("Nuclear", 0.0)
-
-#             records.append(
-#                 GenerationRecord(
-#                     timestamp=timestamp,
-#                     bidding_zone=bidding_zone,
-#                     solar_mw=float(solar) if pd.notna(solar) else 0.0,
-#                     wind_onshore_mw=float(wind_onshore) if pd.notna(wind_onshore) else 0.0,
-#                     wind_offshore_mw=float(wind_offshore) if pd.notna(wind_offshore) else 0.0,
-#                     gas_mw=float(gas) if pd.notna(gas) else 0.0,
-#                     hard_coal_mw=float(coal) if pd.notna(coal) else 0.0,
-#                     nuclear_mw=float(nuclear) if pd.notna(nuclear) else 0.0,
-#                 )
-#             )
-
-#         logger.info("Successfully fetched Generation Mix", zone=bidding_zone, count=len(records))
-#         return records
 
 
 import asyncio
@@ -156,7 +13,7 @@ from src.energy_data_engine.utils.retry import async_retry
 from src.energy_data_engine.models.schemas import (
     DayAheadPriceRecord,
     TotalLoadRecord,
-    GenerationRecord,
+    GenerationRecord,IntradayPriceRecord,
 )
 
 
@@ -320,4 +177,92 @@ class AsyncEntsoeClient:
             )
 
         logger.info("Successfully fetched Generation Mix", zone=bidding_zone, count=len(records))
+        return records
+    @async_retry(retries=3, backoff_factor=1.5)
+    async def fetch_intraday_prices(
+        self, bidding_zone: str, start: datetime, end: datetime
+    ) -> List[IntradayPriceRecord]:
+        """Fetches Intraday Continuous Market VWAP (€/MWh) and Traded Volume (MW)."""
+        logger.info(
+            "Fetching Intraday Continuous Data",
+            zone=bidding_zone,
+            start=start.isoformat(),
+            end=end.isoformat(),
+        )
+
+        def _fetch():
+            # entsoe-py returns a DataFrame with price / volume data
+            return self._sync_client.query_intraday_prices(
+                country_code=bidding_zone.upper(),
+                start=self._format_timestamp(start),
+                end=self._format_timestamp(end),
+            )
+
+        try:
+            df = await asyncio.to_thread(_fetch)
+        except Exception as e:
+            logger.error(
+                "Error fetching intraday data",
+                error=str(e),
+                zone=bidding_zone,
+            )
+            return []
+
+        if df is None or (
+            isinstance(df, (pd.Series, pd.DataFrame)) and df.empty
+        ):
+            return []
+
+        records = []
+
+        # If entsoe-py returns a Series (Price only)
+        if isinstance(df, pd.Series):
+            for timestamp, price in df.items():
+                if pd.isna(price):
+                    continue
+                records.append(
+                    IntradayPriceRecord(
+                        timestamp=pd.to_datetime(timestamp).tz_convert("UTC"),
+                        bidding_zone=bidding_zone,
+                        vwap_eur_mwh=float(price),
+                        volume_mw=0.0,
+                    )
+                )
+
+        # If entsoe-py returns a DataFrame (Price + Volume columns)
+        elif isinstance(df, pd.DataFrame):
+            # Resolve column names dynamically
+            price_col = next(
+                (
+                    c
+                    for c in df.columns
+                    if "price" in str(c).lower() or "vwap" in str(c).lower()
+                ),
+                df.columns[0],
+            )
+            vol_col = next(
+                (c for c in df.columns if "volume" in str(c).lower()), None
+            )
+
+            for timestamp, row in df.iterrows():
+                price_val = row[price_col]
+                vol_val = row[vol_col] if vol_col else 0.0
+
+                if pd.isna(price_val):
+                    continue
+
+                records.append(
+                    IntradayPriceRecord(
+                        timestamp=pd.to_datetime(timestamp).tz_convert("UTC"),
+                        bidding_zone=bidding_zone,
+                        vwap_eur_mwh=float(price_val),
+                        volume_mw=vol_val,  # Your validator handles NaN / string defaults automatically
+                    )
+                )
+
+        logger.info(
+            "Successfully fetched Intraday Records",
+            zone=bidding_zone,
+            count=len(records),
+        )
         return records
