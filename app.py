@@ -541,11 +541,12 @@ if st.sidebar.button("📦 Prepare Clean Excel Workbook"):
 
 
 # --- MAIN DASHBOARD TABS ---
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📊 Price & Load Analytics", 
     "🌱 Generation Mix & Residual Load", 
     "🔄 Cross-Border Spreads",
-    "📈 Detailed Analytics & Features"
+    "📈 Detailed Analytics & Features",
+    "⚡ Trading & Market Fundamentals"
 ])
 
 # --- TAB 1: Day-Ahead & Intraday Prices ---
@@ -816,3 +817,205 @@ with tab4:
 
     except Exception as e:
         st.warning(f"Analytics notice: {e}")
+    # --- TAB 5: Trading & Market Fundamental Metrics ---
+with tab5:
+    st.header(f"⚡ Trading & Market Fundamental Metrics ({bidding_zone})")
+
+    try:
+        raw_prices_df = analytics.query_dataset_by_zone(
+            "day_ahead_prices",
+            zone=bidding_zone
+        )
+
+        raw_gen_df = analytics.query_dataset_by_zone(
+            "generation",
+            zone=bidding_zone
+        )
+
+        raw_load_df = analytics.query_dataset_by_zone(
+            "total_load",
+            zone=bidding_zone
+        )
+
+        prices_df = filter_by_date(raw_prices_df)
+        gen_df = filter_by_date(raw_gen_df)
+        load_df = filter_by_date(raw_load_df)
+
+        if not prices_df.empty and not gen_df.empty and not load_df.empty:
+
+            # Normalize timestamps
+            prices_df["timestamp"] = pd.to_datetime(
+                prices_df["timestamp"],
+                utc=True
+            )
+
+            gen_df["timestamp"] = pd.to_datetime(
+                gen_df["timestamp"],
+                utc=True
+            )
+
+            load_df["timestamp"] = pd.to_datetime(
+                load_df["timestamp"],
+                utc=True
+            )
+
+            merged_df = prices_df.merge(
+                gen_df,
+                on="timestamp",
+                how="inner"
+            ).merge(
+                load_df[["timestamp", "load_mw"]],
+                on="timestamp",
+                how="inner"
+            )
+
+
+            if not merged_df.empty:
+
+                # 1. Fundamental Calculations
+                df_analyzed = FundamentalMetrics.calculate_renewable_penetration(
+                    merged_df
+                )
+
+                neg_stats = FundamentalMetrics.calculate_negative_price_stats(
+                    df_analyzed
+                )
+
+                capture_stats = FundamentalMetrics.calculate_capture_prices(
+                    df_analyzed
+                )
+
+                corr = FundamentalMetrics.calculate_residual_load_price_correlation(
+                    df_analyzed
+                )
+
+
+                # 2. KPI Cards
+                st.subheader("Market Fundamental KPI Dashboard")
+
+                col1, col2, col3, col4 = st.columns(4)
+
+                with col1:
+                    st.metric(
+                        label="Negative Price Frequency",
+                        value=f"{neg_stats['neg_frequency_pct']}%",
+                        delta=f"{neg_stats['neg_hours']} Hours",
+                        delta_color="inverse"
+                    )
+
+                with col2:
+                    st.metric(
+                        label="Baseload Price",
+                        value=f"€{capture_stats.get('baseload_price_eur',0.0):.2f}/MWh"
+                    )
+
+                with col3:
+                    solar_cp = capture_stats.get(
+                        "solar_capture_price",
+                        0.0
+                    )
+
+                    solar_cf = capture_stats.get(
+                        "solar_capture_factor",
+                        0.0
+                    )
+
+                    st.metric(
+                        label="Solar Capture Price",
+                        value=f"€{solar_cp:.2f}/MWh",
+                        delta=f"CF: {solar_cf:.1%}"
+                    )
+
+
+                with col4:
+                    wind_cp = capture_stats.get(
+                        "wind_onshore_capture_price",
+                        0.0
+                    )
+
+                    wind_cf = capture_stats.get(
+                        "wind_onshore_capture_factor",
+                        0.0
+                    )
+
+                    st.metric(
+                        label="Wind Onshore Capture Price",
+                        value=f"€{wind_cp:.2f}/MWh",
+                        delta=f"CF: {wind_cf:.1%}"
+                    )
+
+
+                st.markdown("---")
+
+
+                # 3. Residual Load vs Price Analysis
+                st.subheader(
+                    "📈 Merit Order Dynamics: Residual Load vs Market Price"
+                )
+
+
+                st.markdown(
+                    f"""
+                    **Pearson Correlation:** `{corr}`
+
+                    Residual load represents remaining demand after renewable 
+                    generation. Increasing residual load generally pushes 
+                    higher-cost thermal generators into dispatch, increasing 
+                    market prices.
+                    """
+                )
+
+
+                fig_scatter = px.scatter(
+                    df_analyzed,
+                    x="residual_load_mw",
+                    y="price_eur_mwh",
+                    color="renewable_penetration_pct",
+                    color_continuous_scale="Viridis",
+                    labels={
+                        "residual_load_mw":
+                            "Residual Net Load (MW)",
+
+                        "price_eur_mwh":
+                            "Day-Ahead Price (€/MWh)",
+
+                        "renewable_penetration_pct":
+                            "Renewable Penetration %"
+                    },
+
+                    title=
+                    "Price Elasticity & Merit Order Curve"
+                )
+
+
+                fig_scatter.update_layout(
+                    template="plotly_dark",
+                    height=550
+                )
+
+
+                st.plotly_chart(
+                    fig_scatter,
+                    use_container_width=True
+                )
+
+
+            else:
+                st.warning(
+                    "Price, generation and load data could not be aligned."
+                )
+
+        else:
+            st.info(
+                """
+                Missing price, generation or load data.
+
+                👉 Use **Fetch & Process Market Data** from sidebar.
+                """
+            )
+
+
+    except Exception as e:
+        st.warning(
+            f"Trading analytics notice: {e}"
+        )

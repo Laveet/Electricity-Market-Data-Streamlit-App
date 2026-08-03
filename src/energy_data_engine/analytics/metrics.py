@@ -1,120 +1,6 @@
-# # src/energy_data_engine/features/metrics.py
 
-# import pandas as pd
-# import numpy as np
-# from typing import Dict, List, Optional
-
-
-# class FundamentalMetrics:
-#     """
-#     Calculates quantitative metrics for European wholesale electricity markets.
-#     Designed to process merged DataFrames containing price, load, and generation data.
-#     """
-
-#     RENEWABLE_COLUMNS = [
-#         "Solar",
-#         "Wind Onshore",
-#         "Wind Offshore",
-#         "Hydro Run-of-river and poundage",
-#     ]
-
-#     @staticmethod
-#     def calculate_residual_load(
-#         df: pd.DataFrame,
-#         load_col: str = "load_mw",
-#         renewable_cols: Optional[List[str]] = None,
-#     ) -> pd.DataFrame:
-#         """
-#         Calculates Residual Load = Total Load - Variable Renewable Energy (Solar + Wind Onshore + Wind Offshore)
-#         """
-#         result_df = df.copy()
-
-#         if renewable_cols is None:
-#             renewable_cols = ["Solar", "Wind Onshore", "Wind Offshore"]
-
-#         # Filter cols present in DataFrame
-#         existing_ren_cols = [c for c in renewable_cols if c in result_df.columns]
-
-#         if existing_ren_cols and load_col in result_df.columns:
-#             total_vre = result_df[existing_ren_cols].sum(axis=1)
-#             result_df["total_vre_mw"] = total_vre
-#             result_df["residual_load_mw"] = result_df[load_col] - total_vre
-#         elif load_col in result_df.columns:
-#             result_df["total_vre_mw"] = 0.0
-#             result_df["residual_load_mw"] = result_df[load_col]
-#         else:
-#             result_df["total_vre_mw"] = np.nan
-#             result_df["residual_load_mw"] = np.nan
-
-#         return result_df
-
-#     @staticmethod
-#     def calculate_capture_prices(
-#         df: pd.DataFrame,
-#         price_col: str = "price_eur_mwh",
-#         gen_cols: Optional[List[str]] = None,
-#     ) -> Dict[str, float]:
-#         """
-#         Calculates Volume-Weighted Capture Price (€/MWh) per generation technology.
-#         Capture Price = Sum(Price * Generation_tech) / Sum(Generation_tech)
-#         """
-#         if price_col not in df.columns:
-#             return {}
-
-#         if gen_cols is None:
-#             gen_cols = [
-#                 "Solar",
-#                 "Wind Onshore",
-#                 "Wind Offshore",
-#                 "Nuclear",
-#                 "Fossil Hard coal",
-#                 "Fossil Gas",
-#             ]
-
-#         capture_prices = {}
-#         for tech in gen_cols:
-#             if tech in df.columns:
-#                 valid_mask = df[price_col].notna() & df[tech].notna()
-#                 total_gen = df.loc[valid_mask, tech].sum()
-
-#                 if total_gen > 0:
-#                     weighted_rev = (
-#                         df.loc[valid_mask, price_col] * df.loc[valid_mask, tech]
-#                     ).sum()
-#                     capture_prices[tech] = round(weighted_rev / total_gen, 2)
-#                 else:
-#                     capture_prices[tech] = np.nan
-
-#         return capture_prices
-
-#     @staticmethod
-#     def calculate_renewable_penetration(
-#         df: pd.DataFrame, load_col: str = "load_mw"
-#     ) -> pd.Series:
-#         """
-#         Calculates Renewable Penetration (%) relative to total load.
-#         """
-#         existing_ren_cols = [
-#             c for c in FundamentalMetrics.RENEWABLE_COLUMNS if c in df.columns
-#         ]
-
-#         if existing_ren_cols and load_col in df.columns:
-#             ren_total = df[existing_ren_cols].sum(axis=1)
-#             penetration = (ren_total / df[load_col].replace(0, np.nan)) * 100
-#             return penetration.round(2)
-#         return pd.Series(np.nan, index=df.index)
-
-#     @staticmethod
-#     def calculate_ramp_rates(
-#         df: pd.DataFrame, target_col: str = "residual_load_mw"
-#     ) -> pd.Series:
-#         """
-#         Calculates hourly ramp rate (MW/h change).
-#         """
-#         if target_col in df.columns:
-#             return df[target_col].diff()
-#         return pd.Series(np.nan, index=df.index)
 import pandas as pd
+import numpy as np
 
 
 class FundamentalMetrics:
@@ -160,3 +46,89 @@ class FundamentalMetrics:
         if target_col in result.columns:
             result[f"{target_col}_ramp_mw_h"] = result[target_col].diff().fillna(0.0)
         return result
+    ########Adding further features+#####
+    @staticmethod
+    def calculate_renewable_penetration(df: pd.DataFrame) -> pd.DataFrame:
+        """Calculates total renewables, residual load, and penetration percentage."""
+        df_calc = df.copy()
+
+        expected_cols = ["solar_mw", "wind_onshore_mw", "wind_offshore_mw", "load_mw"]
+        for col in expected_cols:
+            if col not in df_calc.columns:
+                df_calc[col] = 0.0
+
+        df_calc["renewable_total_mw"] = (
+            df_calc["solar_mw"] + 
+            df_calc["wind_onshore_mw"] + 
+            df_calc["wind_offshore_mw"]
+        )
+        df_calc["residual_load_mw"] = df_calc["load_mw"] - df_calc["renewable_total_mw"]
+
+        df_calc["renewable_penetration_pct"] = 0.0
+        mask = df_calc["load_mw"] > 0
+        df_calc.loc[mask, "renewable_penetration_pct"] = (
+            (df_calc.loc[mask, "renewable_total_mw"] / df_calc.loc[mask, "load_mw"]) * 100
+        )
+
+        return df_calc
+
+    @staticmethod
+    def calculate_negative_price_stats(df: pd.DataFrame, price_col: str = "price_eur_mwh"): 
+        """Calculates count and percentage frequency of negative market prices."""
+        if df.empty or price_col not in df.columns:
+            return {"neg_hours": 0, "total_hours": 0, "neg_frequency_pct": 0.0}
+
+        total_hours = len(df)
+        neg_hours = int((df[price_col] < 0).sum())
+        freq_pct = (neg_hours / total_hours * 100) if total_hours > 0 else 0.0
+
+        return {
+            "neg_hours": neg_hours,
+            "total_hours": total_hours,
+            "neg_frequency_pct": round(freq_pct, 2)
+        }
+
+    @staticmethod
+    def calculate_capture_prices(df: pd.DataFrame, price_col: str = "price_eur_mwh"):
+        """
+        Calculates Baseload Price, Renewable Volume-Weighted Capture Prices (VWAP),
+        and Capture Factors per renewable asset class.
+        """
+        if df.empty or price_col not in df.columns:
+            return {}
+
+        baseload = df[price_col].mean()
+        metrics = {"baseload_price_eur": round(baseload, 2)}
+
+        tech_mapping = {
+            "solar": "solar_mw",
+            "wind_onshore": "wind_onshore_mw",
+            "wind_offshore": "wind_offshore_mw"
+        }
+
+        for tech, col in tech_mapping.items():
+            if col in df.columns and df[col].sum() > 0:
+                total_gen = df[col].sum()
+                vwap = (df[col] * df[price_col]).sum() / total_gen
+                capture_factor = (vwap / baseload) if baseload != 0 else 0.0
+
+                metrics[f"{tech}_capture_price"] = round(vwap, 2)
+                metrics[f"{tech}_capture_factor"] = round(capture_factor, 3)
+            else:
+                metrics[f"{tech}_capture_price"] = 0.0
+                metrics[f"{tech}_capture_factor"] = 0.0
+
+        return metrics
+
+    @staticmethod
+    def calculate_residual_load_price_correlation(
+        df: pd.DataFrame, 
+        price_col: str = "price_eur_mwh", 
+        residual_col: str = "residual_load_mw"
+    ) -> float:
+        """Calculates Pearson correlation between Residual Net Load and Day-Ahead Price."""
+        if df.empty or price_col not in df.columns or residual_col not in df.columns:
+            return 0.0
+        
+        corr = df[residual_col].corr(df[price_col])
+        return round(corr, 3) if not np.isnan(corr) else 0.0
