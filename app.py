@@ -408,8 +408,17 @@ sys.path.append(str(Path(__file__).resolve().parent / "src"))
 from src.energy_data_engine.analytics.metrics import FundamentalMetrics
 from src.energy_data_engine.analytics.spreads import SpreadCalculators
 from src.energy_data_engine.analytics.features import AdditionalAnalyticsFeatures
+from src.energy_data_engine.analytics.forecast_errors import (
+    compute_all_metrics,
+    find_worst_error_periods,
+    METRIC_GLOSSARY,
+)
 from src.energy_data_engine.pipeline import EnergyDataPipeline
 from src.energy_data_engine.storage.duck_analytics import DuckDBAnalyticsEngine
+from src.energy_data_engine.storage.parquet_store import ParquetLakehouseWriter
+from src.energy_data_engine.clients.entsoe import AsyncEntsoeClient
+from src.energy_data_engine.forecasting.baseline_forecaster import SeasonalNaiveForecaster
+from config.settings import settings
 
 # Page Configuration
 st.set_page_config(
@@ -486,6 +495,211 @@ def filter_by_date(df: pd.DataFrame, timestamp_col: str = "timestamp") -> pd.Dat
     return df[(df[timestamp_col] >= start_dt) & (df[timestamp_col] < end_dt)]
 
 
+# --- SHARED HELPER: renders one Forecast Accuracy section (Load or Price) ---
+def render_forecast_accuracy_section(
+    section_title: str,
+    y_axis_title: str,
+    unit_label: str,
+    value_fmt: str,
+    bidding_zone: str,
+    zone_tz: str,
+    target_date,
+    actual_dataset: str,
+    actual_value_col: str,
+    reference_dataset: str,
+    reference_value_col: str,
+    reference_label: str,
+    reference_note: str,
+    accuracy_method: str,
+    top_n_worst: int = 3,
+):
+    """Builds the comparison chart, error plot, accuracy metrics, and worst-hour
+    table for one quantity (Load or Price). Works generically for any hourly
+    dataset that has (a) a historical 'actual' series and (b) an optional
+    'reference' series to benchmark against the same actual data."""
+    day_start_local = pd.Timestamp(target_date, tz=zone_tz)
+    day_start_utc = day_start_local.tz_convert("UTC")
+    day_end_utc = (day_start_local + pd.Timedelta(days=1)).tz_convert("UTC")
+
+    history_df = analytics.query_dataset_by_zone(actual_dataset, zone=bidding_zone)
+
+    own_fc_df = SeasonalNaiveForecaster(lookback_weeks=8).forecast(
+        history_df, target_date, zone_timezone=zone_tz, value_col=actual_value_col,
+    ).rename(columns={"own_forecast": "own_value"})
+
+    actual_df = pd.DataFrame()
+    if not history_df.empty:
+        hdf = history_df.copy()
+        hdf["timestamp"] = pd.to_datetime(hdf["timestamp"], utc=True)
+        actual_df = hdf[
+            (hdf["timestamp"] >= day_start_utc) & (hdf["timestamp"] < day_end_utc)
+        ][["timestamp", actual_value_col]].rename(columns={actual_value_col: "actual_value"})
+    has_actual = not actual_df.empty
+
+    reference_df = pd.DataFrame()
+    if reference_dataset:
+        rdf = analytics.query_dataset_by_zone(reference_dataset, zone=bidding_zone)
+        if not rdf.empty:
+            rdf["timestamp"] = pd.to_datetime(rdf["timestamp"], utc=True)
+            reference_df = rdf[
+                (rdf["timestamp"] >= day_start_utc) & (rdf["timestamp"] < day_end_utc)
+            ][["timestamp", reference_value_col]].rename(columns={reference_value_col: "reference_value"})
+    has_reference = not reference_df.empty
+
+    combined = own_fc_df.copy()
+    if has_reference:
+        combined = combined.merge(reference_df, on="timestamp", how="outer")
+    if has_actual:
+        combined = combined.merge(actual_df, on="timestamp", how="outer")
+    combined = combined.sort_values("timestamp").reset_index(drop=True)
+
+    if combined["own_value"].isna().all() and not has_reference and not has_actual:
+        st.info(
+            f"Not enough historical data yet to build a forecast for {target_date.isoformat()}, "
+            f"and no {reference_label} data cached either."
+        )
+        return
+
+    # Data may be hourly or 15-minute (ENTSO-E publishes both, depending on series/zone) --
+    # size the worst-period highlight band to whatever spacing this data actually has,
+    # so it doesn't swallow several neighboring points on fine-grained series.
+    _spacing = combined["timestamp"].sort_values().diff().dropna()
+    _spacing = _spacing[_spacing > pd.Timedelta(0)]
+    period_width = _spacing.median() if not _spacing.empty else pd.Timedelta(hours=1)
+    highlight_half_width = period_width * 0.4
+
+    # --- Main comparison chart, with the single worst period for each forecast highlighted ---
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=combined["timestamp"], y=combined["own_value"], mode="lines+markers",
+        name="App's Own Forecast (Seasonal Baseline)", line=dict(color="#2ca02c", width=2),
+    ))
+    if has_reference:
+        fig.add_trace(go.Scatter(
+            x=combined["timestamp"], y=combined["reference_value"], mode="lines+markers",
+            name=reference_label, line=dict(color="#1f77b4", width=2, dash="dash"),
+        ))
+    if has_actual:
+        fig.add_trace(go.Scatter(
+            x=combined["timestamp"], y=combined["actual_value"], mode="lines+markers",
+            name="Actual", line=dict(color="#d62728", width=3),
+        ))
+
+    worst_own = pd.DataFrame()
+    worst_ref = pd.DataFrame()
+    if has_actual:
+        worst_own = find_worst_error_periods(combined, "actual_value", "own_value", top_n=top_n_worst)
+        if not worst_own.empty:
+            ts0 = worst_own.iloc[0]["timestamp"]
+            fig.add_vrect(
+                x0=ts0 - highlight_half_width, x1=ts0 + highlight_half_width,
+                fillcolor="#2ca02c", opacity=0.18, line_width=0,
+                annotation_text="Own's worst period", annotation_position="top left",
+            )
+        if has_reference:
+            worst_ref = find_worst_error_periods(combined, "actual_value", "reference_value", top_n=top_n_worst)
+            if not worst_ref.empty:
+                ts1 = worst_ref.iloc[0]["timestamp"]
+                fig.add_vrect(
+                    x0=ts1 - highlight_half_width, x1=ts1 + highlight_half_width,
+                    fillcolor="#1f77b4", opacity=0.18, line_width=0,
+                    annotation_text=f"{reference_label}'s worst period", annotation_position="bottom left",
+                )
+
+    fig.update_layout(
+        title=f"{section_title} — {bidding_zone} — {target_date.isoformat()}",
+        xaxis_title=f"Local Time ({zone_tz})",
+        yaxis_title=y_axis_title,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # --- Error-over-time chart: shaded area shows the size of the miss at every hour ---
+    if has_actual:
+        fig_err = go.Figure()
+        own_err = combined["own_value"] - combined["actual_value"]
+        fig_err.add_trace(go.Scatter(
+            x=combined["timestamp"], y=own_err, mode="lines", name="Own Forecast Error",
+            fill="tozeroy", line=dict(color="#2ca02c"),
+        ))
+        if has_reference:
+            ref_err = combined["reference_value"] - combined["actual_value"]
+            fig_err.add_trace(go.Scatter(
+                x=combined["timestamp"], y=ref_err, mode="lines", name=f"{reference_label} Error",
+                fill="tozeroy", line=dict(color="#1f77b4"),
+            ))
+        fig_err.add_hline(y=0, line_color="gray", line_width=1)
+        fig_err.update_layout(
+            title="Forecast Error Over Time (Forecast − Actual) — shaded area = size of the miss",
+            xaxis_title=f"Local Time ({zone_tz})",
+            yaxis_title=f"Error ({unit_label})",
+            hovermode="x unified",
+            height=300,
+        )
+        st.plotly_chart(fig_err, use_container_width=True)
+
+        # --- Accuracy metrics, scored against actual ---
+        st.subheader("📏 Forecast Accuracy vs. Actual")
+        m1, m2 = st.columns(2)
+        with m1:
+            st.markdown("**App's Own Forecast**")
+            own_metrics = compute_all_metrics(combined["actual_value"], combined["own_value"], method=accuracy_method)
+            st.metric(f"Accuracy (100 − {accuracy_method.upper()})", f"{own_metrics['accuracy_pct']:.1f}%")
+            oc1, oc2, oc3, oc4 = st.columns(4)
+            oc1.metric("MAE", value_fmt.format(own_metrics["mae"]))
+            oc2.metric("RMSE", value_fmt.format(own_metrics["rmse"]))
+            oc3.metric("MSE", f"{own_metrics['mse']:,.1f}")
+            oc4.metric("MAPE", f"{own_metrics['mape_pct']:.2f}%")
+        with m2:
+            st.markdown(f"**{reference_label}**")
+            if has_reference:
+                ref_metrics = compute_all_metrics(combined["actual_value"], combined["reference_value"], method=accuracy_method)
+                st.metric(f"Accuracy (100 − {accuracy_method.upper()})", f"{ref_metrics['accuracy_pct']:.1f}%")
+                rc1, rc2, rc3, rc4 = st.columns(4)
+                rc1.metric("MAE", value_fmt.format(ref_metrics["mae"]))
+                rc2.metric("RMSE", value_fmt.format(ref_metrics["rmse"]))
+                rc3.metric("MSE", f"{ref_metrics['mse']:,.1f}")
+                rc4.metric("MAPE", f"{ref_metrics['mape_pct']:.2f}%")
+            else:
+                st.info(reference_note)
+
+        st.markdown("**🔻 Time periods with the largest forecast error**")
+        wc1, wc2 = st.columns(2)
+        with wc1:
+            st.caption("App's Own Forecast")
+            if not worst_own.empty:
+                show = worst_own.copy()
+                show["timestamp"] = show["timestamp"].dt.tz_convert(zone_tz).dt.strftime("%Y-%m-%d %H:%M")
+                st.dataframe(show[["timestamp", "actual", "forecast", "abs_error", "pct_error"]], hide_index=True, use_container_width=True)
+            else:
+                st.caption("—")
+        with wc2:
+            st.caption(reference_label)
+            if not worst_ref.empty:
+                show = worst_ref.copy()
+                show["timestamp"] = show["timestamp"].dt.tz_convert(zone_tz).dt.strftime("%Y-%m-%d %H:%M")
+                st.dataframe(show[["timestamp", "actual", "forecast", "abs_error", "pct_error"]], hide_index=True, use_container_width=True)
+            else:
+                st.caption("—")
+
+    else:
+        st.subheader("🔀 Forecast Divergence (actual data not available yet)")
+        st.info(
+            f"{target_date.isoformat()} hasn't happened (or hasn't been published) yet, so "
+            "there's no actual data to score against. Shown instead: how far the two "
+            "forecasts currently disagree with each other."
+        )
+        if has_reference:
+            div_metrics = compute_all_metrics(combined["reference_value"], combined["own_value"], method=accuracy_method)
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Mean Absolute Divergence", value_fmt.format(div_metrics["mae"]))
+            d2.metric("Divergence %", f"{div_metrics['mape_pct']:.2f}%")
+            d3.metric("RMS Divergence", value_fmt.format(div_metrics["rmse"]))
+        else:
+            st.warning(reference_note)
+
+
 # --- SIDEBAR CONTROLS ---
 st.sidebar.header("🕹️ Market Controls")
 bidding_zone = st.sidebar.selectbox("Select Primary Bidding Zone", ["DE_LU", "FR", "NL"], index=0)
@@ -541,12 +755,13 @@ if st.sidebar.button("📦 Prepare Clean Excel Workbook"):
 
 
 # --- MAIN DASHBOARD TABS ---
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📊 Price & Load Analytics", 
-    "🌱 Generation Mix & Residual Load", 
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 Price & Load Analytics",
+    "🌱 Generation Mix & Residual Load",
     "🔄 Cross-Border Spreads",
     "📈 Detailed Analytics & Features",
-    "⚡ Trading & Market Fundamentals"
+    "⚡ Trading & Market Fundamentals",
+    "🎯 Forecast Accuracy",
 ])
 
 # --- TAB 1: Day-Ahead & Intraday Prices ---
@@ -1019,3 +1234,130 @@ with tab5:
         st.warning(
             f"Trading analytics notice: {e}"
         )
+
+
+# --- TAB 6: Forecast Accuracy (Load & Price) ---
+with tab6:
+    st.header(f"🎯 Forecast Accuracy ({bidding_zone})")
+    st.markdown(
+        "Compares this app's own baseline forecast against a published reference "
+        "series, and — once actual data is available — scores both against reality. "
+        "Pick a *future* date to see how the two forecasts currently diverge from "
+        "each other, or a *past* date to see which one was more accurate."
+    )
+
+    with st.expander("ℹ️ What do MSE, RMSE, MAPE, WAPE and Accuracy % mean?"):
+        for short_name, long_name, description in METRIC_GLOSSARY:
+            st.markdown(f"**{short_name}** ({long_name}) — {description}")
+
+    fc_col1, fc_col2, fc_col3 = st.columns([2, 1.3, 1.3])
+    with fc_col1:
+        target_date = st.date_input(
+            "🎯 Target Date to Forecast",
+            value=date.today() + timedelta(days=1),
+            key="forecast_target_date",
+        )
+    with fc_col2:
+        accuracy_method_choice = st.radio(
+            "Headline Accuracy Metric",
+            options=["WAPE (recommended)", "MAPE"],
+            key="accuracy_method_choice",
+        )
+        accuracy_method = "wape" if accuracy_method_choice.startswith("WAPE") else "mape"
+    with fc_col3:
+        st.markdown("&nbsp;")
+        fetch_entsoe_forecast = st.button("🔮 Fetch ENTSO-E Load Forecast")
+
+    try:
+        zone_cfg = settings.load_zone_config().get("bidding_zones", {}).get(bidding_zone, {})
+        zone_tz = zone_cfg.get("timezone", "UTC")
+    except Exception as e:
+        zone_tz = "UTC"
+        st.warning(f"Could not load zone timezone config, defaulting to UTC: {e}")
+
+    if fetch_entsoe_forecast:
+        try:
+            fc_day_start_local = pd.Timestamp(target_date, tz=zone_tz)
+            fc_day_start_utc = fc_day_start_local.tz_convert("UTC")
+            fc_day_end_utc = (fc_day_start_local + pd.Timedelta(days=1)).tz_convert("UTC")
+            with st.spinner("Fetching ENTSO-E day-ahead load forecast..."):
+                entsoe_client = AsyncEntsoeClient()
+                fc_records = asyncio.run(
+                    entsoe_client.fetch_load_forecast(
+                        bidding_zone, fc_day_start_utc.to_pydatetime(), fc_day_end_utc.to_pydatetime()
+                    )
+                )
+                if fc_records:
+                    ParquetLakehouseWriter().write_records(fc_records, dataset_name="total_load_forecast")
+                    st.success(
+                        f"✅ Cached ENTSO-E load forecast for {target_date.isoformat()} "
+                        f"({len(fc_records)} hourly points)."
+                    )
+                else:
+                    st.warning(
+                        "ENTSO-E returned no forecast data for this date — it may be outside "
+                        "their published horizon (typically available from ~1 day before delivery)."
+                    )
+        except Exception as e:
+            st.warning(f"ENTSO-E forecast fetch notice: {e}")
+
+    load_subtab, price_subtab = st.tabs(["⚡ Load Forecast (MW)", "💶 Price Forecast (€/MWh)"])
+
+    with load_subtab:
+        try:
+            render_forecast_accuracy_section(
+                section_title="Load Forecast Comparison",
+                y_axis_title="Load (MW)",
+                unit_label="MW",
+                value_fmt="{:,.0f} MW",
+                bidding_zone=bidding_zone,
+                zone_tz=zone_tz,
+                target_date=target_date,
+                actual_dataset="total_load",
+                actual_value_col="load_mw",
+                reference_dataset="total_load_forecast",
+                reference_value_col="forecast_load_mw",
+                reference_label="ENTSO-E Day-Ahead Forecast",
+                reference_note=(
+                    "No ENTSO-E forecast cached for this date yet. Click "
+                    "**🔮 Fetch ENTSO-E Load Forecast** above."
+                ),
+                accuracy_method=accuracy_method,
+            )
+        except Exception as e:
+            st.warning(f"Load Forecast Accuracy notice: {e}")
+
+    with price_subtab:
+        st.caption(
+            "ℹ️ ENTSO-E does not publish a separate day-ahead **price** forecast — the "
+            "Day-Ahead price *is* the settled market outcome, fixed ~12–36h before "
+            "delivery, so it's treated here as the value being forecast (same role "
+            "Actual Load plays on the Load tab). The reference series shown instead is "
+            "the **Intraday Market VWAP** — the volume-weighted price actually traded "
+            "much closer to real time — as the closest available 'how did the day-ahead "
+            "price compare to what really happened' benchmark. Use the sidebar's "
+            "**Fetch & Process Market Data** to backfill Day-Ahead / Intraday price data "
+            "for more dates (no separate fetch button needed here)."
+        )
+        try:
+            render_forecast_accuracy_section(
+                section_title="Price Forecast Comparison",
+                y_axis_title="Price (€/MWh)",
+                unit_label="€/MWh",
+                value_fmt="{:,.2f} €/MWh",
+                bidding_zone=bidding_zone,
+                zone_tz=zone_tz,
+                target_date=target_date,
+                actual_dataset="day_ahead_prices",
+                actual_value_col="price_eur_mwh",
+                reference_dataset="intraday_prices",
+                reference_value_col="vwap_eur_mwh",
+                reference_label="Intraday Market VWAP",
+                reference_note=(
+                    "No intraday price data cached for this date yet. Use the sidebar's "
+                    "**Fetch & Process Market Data**."
+                ),
+                accuracy_method=accuracy_method,
+            )
+        except Exception as e:
+            st.warning(f"Price Forecast Accuracy notice: {e}")

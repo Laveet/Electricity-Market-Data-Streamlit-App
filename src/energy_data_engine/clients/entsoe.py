@@ -13,6 +13,7 @@ from src.energy_data_engine.utils.retry import async_retry
 from src.energy_data_engine.models.schemas import (
     DayAheadPriceRecord,
     TotalLoadRecord,
+    LoadForecastRecord,
     GenerationRecord,IntradayPriceRecord,
 )
 
@@ -116,6 +117,62 @@ class AsyncEntsoeClient:
             )
 
         logger.info("Successfully fetched Total Load", zone=bidding_zone, count=len(records))
+        return records
+
+    # =======================================================
+    # 2b. Day-Ahead Load Forecast (DocumentType: A65, Process: A01)
+    # =======================================================
+    @async_retry(retries=3, backoff_factor=1.5)
+    async def fetch_load_forecast(
+        self, bidding_zone: str, start: datetime, end: datetime
+    ) -> List[LoadForecastRecord]:
+        """Fetches ENTSO-E's own Day-Ahead Total Load Forecast (MW) for a specified zone.
+
+        This is ENTSO-E's published forecast (published ~1 day before delivery), distinct
+        from the Actual Load fetched by `fetch_total_load`. Used as a benchmark to compare
+        against this app's own baseline forecast in the Forecast Accuracy tab.
+        """
+        logger.info(
+            "Fetching Day-Ahead Load Forecast",
+            zone=bidding_zone,
+            start=start.isoformat(),
+            end=end.isoformat(),
+        )
+
+        def _fetch():
+            return self._sync_client.query_load_forecast(
+                country_code=bidding_zone.upper(),
+                start=self._format_timestamp(start),
+                end=self._format_timestamp(end),
+            )
+
+        df: pd.DataFrame | pd.Series = await asyncio.to_thread(_fetch)
+
+        if df is None or (isinstance(df, (pd.Series, pd.DataFrame)) and df.empty):
+            return []
+
+        if isinstance(df, pd.DataFrame):
+            # entsoe-py typically returns a "Forecasted Load" column; fall back to the
+            # first column if the library's naming changes in a future version.
+            matching_cols = [c for c in df.columns if "forecast" in str(c).lower()]
+            series = df[matching_cols[0]] if matching_cols else df.iloc[:, 0]
+        else:
+            series = df
+
+        records = []
+        for timestamp, load in series.items():
+            if pd.isna(load):
+                continue
+            ts_utc = pd.to_datetime(timestamp).tz_convert("UTC")
+            records.append(
+                LoadForecastRecord(
+                    timestamp=ts_utc,
+                    bidding_zone=bidding_zone,
+                    forecast_load_mw=float(load),
+                )
+            )
+
+        logger.info("Successfully fetched Day-Ahead Load Forecast", zone=bidding_zone, count=len(records))
         return records
 
     # =======================================================

@@ -3,7 +3,12 @@ import pandas as pd
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from src.energy_data_engine.models.schemas import DayAheadPriceRecord, GenerationRecord, TotalLoadRecord
+from src.energy_data_engine.models.schemas import (
+    DayAheadPriceRecord,
+    GenerationRecord,
+    TotalLoadRecord,
+    LoadForecastRecord,
+)
 from src.energy_data_engine.storage.parquet_store import ParquetLakehouseWriter
 
 def generate_mock_datasets():
@@ -77,7 +82,27 @@ def generate_mock_datasets():
             )
         writer.write_records(gen_records, dataset_name="generation")
 
-    print("✅ All sample datasets (prices, load, generation) successfully populated in Lakehouse!")
+        # 4. Day-Ahead Load Forecast (a deliberately noisier version of the load pattern,
+        #    extended ~2 days into the future so the Load Forecast Accuracy tab's
+        #    "future date" comparison view can be exercised without a real API key)
+        forecast_end_dt = end_dt + timedelta(days=2)
+        forecast_timestamps = pd.date_range(start=start_dt, end=forecast_end_dt, freq="1h", tz="UTC")
+        forecast_records = []
+        for ts in forecast_timestamps:
+            daily_pattern = 10000 * np.sin(2 * np.pi * (ts.hour - 6) / 24)
+            forecast_noise = np.random.normal(0, 1800)  # a bit noisier than "actual" to mimic real forecast error
+            forecast_load = max(1000.0, load_base + daily_pattern + forecast_noise)
+
+            forecast_records.append(
+                LoadForecastRecord(
+                    timestamp=ts,
+                    bidding_zone=zone,
+                    forecast_load_mw=round(forecast_load, 2)
+                )
+            )
+        writer.write_records(forecast_records, dataset_name="total_load_forecast")
+
+    print("✅ All sample datasets (prices, load, load forecast, generation) successfully populated in Lakehouse!")
 
 if __name__ == "__main__":
     generate_mock_datasets()
