@@ -1,10 +1,11 @@
 """
 Automated Daily Ingestion Script for energy-data-engine.
 
-Fetches the latest market data for DE_LU, FR, and NL asynchronously and writes 
+Fetches the latest market data for DE_LU, FR, and NL asynchronously and writes
 directly to partitioned Parquet lakehouse storage:
   - data/lakehouse/day_ahead_prices
   - data/lakehouse/total_load
+  - data/lakehouse/total_load_forecast
   - data/lakehouse/generation
 """
 
@@ -40,6 +41,8 @@ async def process_zone_dataset(client: AsyncEntsoeClient, writer: ParquetLakehou
             records = await client.fetch_day_ahead_prices(zone, start_date, end_date)
         elif dataset_name == "total_load":
             records = await client.fetch_total_load(zone, start_date, end_date)
+        elif dataset_name == "total_load_forecast":
+            records = await client.fetch_load_forecast(zone, start_date, end_date)
         elif dataset_name == "generation":
             records = await client.fetch_generation(zone, start_date, end_date)
         else:
@@ -67,6 +70,11 @@ async def run_daily_ingestion(days_back: int = 2):
     zones = getattr(settings, "TARGET_ZONES", ["DE_LU", "FR", "NL"])
     datasets = ["day_ahead_prices", "total_load", "generation"]
 
+    # ENTSO-E's day-ahead load forecast is published looking *forward*, so it needs a
+    # window extending past `end_date` to pick up the freshly-published next-day forecast
+    # (rather than only the backward-looking window used for actuals/prices).
+    forecast_end_date = end_date + timedelta(days=2)
+
     logger.info(f"🚀 Starting daily ingestion from {start_date.strftime('%Y-%m-%d %H:%M UTC')} to {end_date.strftime('%Y-%m-%d %H:%M UTC')}")
     logger.info(f"🌐 Target Zones: {zones}")
 
@@ -78,6 +86,11 @@ async def run_daily_ingestion(days_back: int = 2):
     for zone in zones:
         for dataset in datasets:
             tasks.append(process_zone_dataset(client, writer, zone, dataset, start_date, end_date))
+        tasks.append(
+            process_zone_dataset(
+                client, writer, zone, "total_load_forecast", start_date, forecast_end_date
+            )
+        )
 
     # Run tasks concurrently
     await asyncio.gather(*tasks)

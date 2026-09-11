@@ -93,6 +93,19 @@ class TotalLoadRecord(BaseEnergyRecord):
 
 
 # ==========================================
+# 3b. Day-Ahead Load Forecast Schema ($A65$ / Process A01)
+# ==========================================
+class LoadForecastRecord(BaseEnergyRecord):
+    """Schema for ENTSO-E's own Day-Ahead Total Load Forecast (MW)."""
+
+    forecast_load_mw: float = Field(
+        ...,
+        ge=0.0,
+        description="ENTSO-E day-ahead forecasted total load in MW"
+    )
+
+
+# ==========================================
 # 4. Actual Generation per Production Type Schema ($A75$)
 # ==========================================
 class GenerationRecord(BaseEnergyRecord):

@@ -24,7 +24,7 @@ class EnergyDataPipeline:
         start: datetime,
         end: datetime,
     ):
-        """Executes full ingestion across Day-Ahead Prices, Total Load, and Generation for target zones."""
+        """Executes full ingestion across Day-Ahead Prices, Total Load, Load Forecast, and Generation for target zones."""
         logger.info("Starting End-to-End Ingestion Pipeline", zones=bidding_zones, start=start, end=end)
 
         for zone in bidding_zones:
@@ -43,6 +43,16 @@ class EnergyDataPipeline:
                     self.writer.write_records(load_records, dataset_name="total_load")
             except Exception as e:
                 logger.error("Failed fetching total load", zone=zone, error=str(e))
+
+            # 2b. Fetch & Store Day-Ahead Load Forecast (archived daily so it can be
+            # backtested against actuals later, since ENTSO-E's forecast API only
+            # covers a limited lookback window).
+            try:
+                load_forecast_records = await self.client.fetch_load_forecast(zone, start, end)
+                if load_forecast_records:
+                    self.writer.write_records(load_forecast_records, dataset_name="total_load_forecast")
+            except Exception as e:
+                logger.error("Failed fetching load forecast", zone=zone, error=str(e))
 
             # 3. Fetch & Store Generation Mix
             try:
